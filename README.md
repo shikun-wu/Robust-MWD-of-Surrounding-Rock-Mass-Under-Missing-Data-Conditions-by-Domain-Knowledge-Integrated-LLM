@@ -8,8 +8,7 @@ Measurement While Drilling (MWD) for surrounding rock quality holds significant 
 
 The dataset employed in this study is derived from the open-source research by **Hansen et al. (2024)**
 
-- **Original Source:** [Predicting rock type from MWD tunnel data (SSRN)](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4729646) or related repository.
-
+- **Original Source:** [Predicting rock type from MWD tunnel data (SSRN)](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4729646) . The processed tabular dataset are publicly available on Zenodo for research DOI: 10.5281/zenodo.10358374.
 
 ## 🤖 LLM Backbone & Setup
 
