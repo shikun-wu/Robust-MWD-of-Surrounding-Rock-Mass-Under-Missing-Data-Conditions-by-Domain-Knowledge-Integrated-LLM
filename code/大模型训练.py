@@ -4,8 +4,10 @@ import pandas as pd
 import json
 import os
 import shutil
+import re
 from sklearn.model_selection import train_test_split
 from sklearn.impute import KNNImputer
+from imblearn.over_sampling import SMOTE
 from datasets import load_dataset, Dataset
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, pipeline,
@@ -25,6 +27,19 @@ known_classes = [
     "Granittic_gneiss", "Gravel", "Hagaberg_shale", "Hornfels", "Huk_Hagaberg", "Huk_limestone",
     "Mænaitt", "Pegmatite", "Rhomb_porphyry", "Syenite"
 ]
+
+KNOWLEDGE_FILE = "english_domain_knowledge.json"
+
+if os.path.exists(KNOWLEDGE_FILE):
+    with open(KNOWLEDGE_FILE, 'r', encoding='utf-8') as f:
+        KNOWLEDGE_DICTIONARY = json.load(f)
+    print(f"✅ 已加载外部知识字典: {KNOWLEDGE_FILE}")
+else:
+    print(f"⚠️ 警告: 未找到 {KNOWLEDGE_FILE}，将使用空字典或默认描述。")
+    KNOWLEDGE_DICTIONARY = {}
+
+def get_knowledge(rock_type):
+    return KNOWLEDGE_DICTIONARY.get(str(rock_type), "Typical hard rock formation found in tunnel excavation.")
 
 FEATURE_GROUPS = [
     ["PenetrNormMean", "PenetrNormMedian", "PenetrNormVariance", "PenetrNormStandardDeviation", "PenetrNormSkewness", "PenetrNormKurtosis"],
@@ -76,7 +91,7 @@ def inject_missing_values(df, feature_groups, target_ratio=0.2):
     
     print(f"   正在制造缺失值... 目标缺失率: {target_ratio:.1%}")
     
-    # 逐行处理：按概率决定是否让某个特征组（6个特征）整体缺失
+    # 让某个特征组（6个特征）整体缺失
     prob = target_ratio
     count_missing = 0
     
@@ -101,15 +116,12 @@ def apply_knn_imputation(train_df, val_df, test_df, feature_cols, n_neighbors=4)
     X_val = val_df[feature_cols].values
     X_test = test_df[feature_cols].values
     
-    # Fit on Train
     imputer.fit(X_train)
     
-    # Transform all
     X_train_filled = imputer.transform(X_train)
     X_val_filled = imputer.transform(X_val)
     X_test_filled = imputer.transform(X_test)
     
-    # 重组 DataFrame
     train_filled = train_df.copy()
     val_filled = val_df.copy()
     test_filled = test_df.copy()
@@ -127,12 +139,15 @@ def generate_finetune_data(df, feature_cols, label_col, output_file):
     print(f"⏳ 正在生成微调指令数据 ({output_file})...")
     
     for _, row in df.iterrows():
+        rock_type = row[label_col]
+        knowledge_desc = get_knowledge(rock_type)
+        
         all_features = [
             f"{col}: {row[col]:.4f}" for col in feature_cols
         ]
         
         sample = {
-            "instruction": "根据提供的岩石特征，预测其所属类别。仅返回类别名称，不添加任何额外说明。",
+            "instruction": f"根据提供的岩石特征，预测其所属类别。参考知识：{knowledge_desc}。仅返回类别名称。",
             "input": f"已知岩石特征：{'; '.join(all_features)}",
             "output": f"{row[label_col]}"
         }
@@ -147,7 +162,6 @@ def generate_finetune_data(df, feature_cols, label_col, output_file):
 def finetune_llm(base_model_path, finetune_data_path, lora_weights_dir):
     print(f"\n🚀 开始加载模型进行微调: {base_model_path}")
     
-    # 如果存在旧权重，先清理，防止混合
     if os.path.exists(lora_weights_dir):
         print("⚠️ 检测到旧权重目录，正在清理...")
         shutil.rmtree(lora_weights_dir)
@@ -202,6 +216,113 @@ def finetune_llm(base_model_path, finetune_data_path, lora_weights_dir):
     
     del model, trainer
     torch.cuda.empty_cache()
+
+def synthesize_minority_samples(df_filled, generator, feature_cols, label_col, min_samples=5, smote_threshold=10):
+
+    print("\n🧪 开始样本合成 ...")
+    
+    df_temp = df_filled.copy()
+    df_temp.rename(columns={label_col: 'label'}, inplace=True)
+    
+    class_counts = df_temp['label'].value_counts()
+    print(f"原始类别分布（部分）：\n{class_counts.tail(10)}")
+
+    synthetic_samples = []  
+    smote_samples = []      
+
+    smote_classes = [cls for cls, cnt in class_counts.items() if min_samples <= cnt < smote_threshold]
+    llm_classes = [cls for cls, cnt in class_counts.items() if cnt < min_samples]
+
+    if smote_classes:
+        print(f"\n👉 使用 SMOTE 处理中等样本类别 (5<=N<10)：{smote_classes}")
+        smote_data = df_temp[df_temp['label'].isin(smote_classes)]
+        
+        if len(smote_data) > 0:
+            X_smote = smote_data[feature_cols].values
+            y_smote = smote_data['label'].values 
+
+            min_n = class_counts[smote_classes].min()
+            k_neighbors = min(5, min_n - 1) if min_n > 1 else 1
+            
+            smote = SMOTE(random_state=42, k_neighbors=k_neighbors)
+
+            try:
+                X_resampled, y_resampled = smote.fit_resample(X_smote, y_smote)
+                new_features = X_resampled[len(X_smote):]
+                new_labels = y_resampled[len(y_smote):]
+                
+                for features, label in zip(new_features, new_labels):
+                    smote_sample = dict(zip(feature_cols, features))
+                    smote_sample['label'] = label
+                    smote_samples.append(smote_sample)
+            except Exception as e:
+                print(f"⚠️ SMOTE 失败: {e}")
+
+    if llm_classes and generator:
+        print(f"\n👉 使用 LLM 生成极少样本类别 (N<5)：{llm_classes}")
+        
+        for class_label in llm_classes:
+            count = class_counts[class_label]
+            num_needed = min_samples - count
+            print(f" 为类别 '{class_label}' 生成 {num_needed} 个样本...")
+
+            class_data = df_temp[df_temp['label'] == class_label][feature_cols]
+            stats = class_data.describe()
+            total_features = len(feature_cols)
+            class_knowledge = get_knowledge(class_label)
+
+            for i in range(num_needed):
+                prompt = f"""### 指令：
+必须生成岩石类别为'{class_label}'的样本，严格满足：
+1. 共{total_features}个特征，用英文逗号分隔
+2. 每个特征为数字（保留4位小数）
+3. 仅返回数值列表，无任何额外文字/符号
+### 领域知识：{class_knowledge}
+### 特征统计参考：
+{stats.to_string()}
+### 输出："""
+
+                try:
+                    response = generator(prompt, max_new_tokens=300, temperature=0.1, return_full_text=False)
+                    output_text = response[0]['generated_text'].strip()
+                    
+                    # 清洗提取数值
+                    output_clean = re.sub(r'[^\d.,-]', '', output_text)
+                    values = [v.strip() for v in output_clean.split(',') if v.strip()]
+                    
+                    valid_values = []
+                    for v in values:
+                        try: valid_values.append(round(float(v), 4))
+                        except: continue
+
+                    # 补齐或截断
+                    if len(valid_values) > total_features:
+                        valid_values = valid_values[:total_features]
+                    elif len(valid_values) < total_features:
+                        missing = total_features - len(valid_values)
+                        fill_values = [class_data[col].mean() for col in feature_cols[-missing:]]
+                        valid_values += fill_values
+                        valid_values = [0.0 if np.isnan(v) else v for v in valid_values]
+
+                    if len(valid_values) == total_features:
+                        synthetic = dict(zip(feature_cols, valid_values))
+                        synthetic['label'] = class_label
+                        synthetic_samples.append(synthetic)
+                    else:
+                        print(f"   特征数不匹配 ({len(valid_values)}), 跳过")
+                except Exception as e:
+                    print(f"   生成异常: {e}")
+
+    # 合并
+    all_synthetic = synthetic_samples + smote_samples
+    if all_synthetic:
+        synthetic_df = pd.DataFrame(all_synthetic)
+        synthetic_df.rename(columns={'label': label_col}, inplace=True)
+        df_balanced = pd.concat([df_filled, synthetic_df], ignore_index=True)
+        print(f"✅ 合成完成：新增 {len(synthetic_samples)} 个LLM样本, {len(smote_samples)} 个SMOTE样本")
+        return df_balanced
+    
+    return df_filled
 
 # 6. 批量推理
 def batch_predict(model, tokenizer, df, feature_cols, batch_size=32):
@@ -299,7 +420,17 @@ def main(retrain=False):
     tokenizer = AutoTokenizer.from_pretrained(config["model_path"], trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # 7. 对 Val 和 Test 进行预测 (使用填补后的数据)
+    #样本合成
+    print("\n 准备进行样本合成...")
+    generator = pipeline("text-generation", model=model, tokenizer=tokenizer, device=0)
+    
+    # 对训练集进行增强
+    train_enhanced = synthesize_minority_samples(
+        train_filled, generator, feature_cols, label_col, 
+        min_samples=5, smote_threshold=10
+    )
+
+    # 对 Val 和 Test 进行预测 (使用填补后的数据)
     print("\n🔮 对 [验证集] (已KNN修复) 进行预测...")
     val_filled['llm_prediction'] = batch_predict(model, tokenizer, val_filled, feature_cols)
     
@@ -307,7 +438,7 @@ def main(retrain=False):
     test_filled['llm_prediction'] = batch_predict(model, tokenizer, test_filled, feature_cols)
 
     # 8. 保存文件供下游任务使用
-    train_filled.to_csv(os.path.join(config["output_dir"], "train_final.csv"), index=False)
+    train_enhanced.to_csv(os.path.join(config["output_dir"], "train_final.csv"), index=False)
     val_filled.to_csv(os.path.join(config["output_dir"], "val_with_llm.csv"), index=False)
     test_filled.to_csv(os.path.join(config["output_dir"], "test_with_llm.csv"), index=False)
 
